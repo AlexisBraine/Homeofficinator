@@ -1,0 +1,11 @@
+[project]
+name = "homeofficinator"
+version = "1.0.0"
+dependencies = [
+    "streamlit",
+]
+requires-python = ">=3.10"
+authors = [
+    { name = "Alexis Braine", email = "alexis.braine94@gmail.com" }
+]
+license = { text = "GPL v3" }
