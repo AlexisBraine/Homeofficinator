@@ -2,8 +2,9 @@
 name = "homeofficinator"
 version = "1.0.0"
 dependencies = [
-    "PyQt5",
     "pydantic",
+    "PyQt5",
+    "requests",
 ]
 requires-python = ">=3.10"
 authors = [

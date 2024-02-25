@@ -11,7 +11,6 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QLineEdit,
     QLabel,
-    QSpinBox,
     QDateEdit,
     QCheckBox,
     QMainWindow,
@@ -24,16 +23,15 @@ from pydantic import (
     BaseModel,
     model_validator,
     BeforeValidator,
-    PositiveInt,
-    ValidationError,
 )
+
 
 # region Constants
 HOST = "https://lengow.ilucca.net"
 POST_LEAVE_ROUTE = "/api/v3/leaveRequestFactory?isCreation=true"
 GET_LEAVE_ROUTE = "/api/v3/leaves"
-
-HTTP_DEBUG = True
+ME_ROUTE = "/api/v3/users/me"
+MAX_DAYS_BETWEEN_DATES = 100
 
 PAYLOAD = {
     "daysUnit": True,
@@ -69,6 +67,7 @@ PAYLOAD = {
     "unit": 0,
     "autoCreate": True,
 }
+
 
 # endregion
 
@@ -107,6 +106,7 @@ DayList = Annotated[list[rrule.weekday], BeforeValidator(check_days)]
 
 
 class Params(BaseModel):
+    """Dataclass for all the user-selected data"""
 
     class Config:
         arbitrary_types_allowed = True
@@ -114,29 +114,35 @@ class Params(BaseModel):
     cookies: Cookies
     date_from: DateValidator
     date_to: DateValidator
-    owner_id: PositiveInt
     days: DayList
 
     @model_validator(mode="after")
     def _check_dates(self) -> None:
+        """Check the validity of the chosen dates, relative to each other"""
         if (
             self.date_from > self.date_to
-            or self.date_to - self.date_from > datetime.timedelta(days=100)
+            or self.date_to - self.date_from
+            > datetime.timedelta(days=MAX_DAYS_BETWEEN_DATES)
         ):
             raise DataError("Dates incorrect (cannot be more than 100 days apart")
 
     @cached_property
     def session(self) -> requests.Session:
+        """Return a session initiated with the user-given sweet sweet cookies"""
         sess = requests.Session()
         sess.cookies.update(self.cookies)
         return sess
 
     @cached_property
-    def owner_name(self) -> str:
-        ...
-        # TODO IMPLEMENT
+    def owner_id(self) -> int:
+        """Using the session (thus the user's cookies), get the user ID"""
+        ans = _http_get_owner_id(self.session)
+        owner_id = ans.json()["data"]["id"]
+        print(f"Owner ID is {owner_id}")
+        return owner_id
 
     def close(self):
+        """Close the requests session"""
         self.session.close()
 
 
@@ -144,9 +150,11 @@ class Params(BaseModel):
 
 
 # region http calls
+#  Here, all the HTTP calls will be stored, for ease of decoupling
 def _http_get_all_leaves(
     sess: requests.Session, data: dict[str, Any]
 ) -> requests.Response:
+    """Get all current leaves for the user"""
     return sess.get(
         HOST + GET_LEAVE_ROUTE,
         params=data,
@@ -156,20 +164,27 @@ def _http_get_all_leaves(
 def _http_request_leave(
     sess: requests.Session, data: dict[str, Any]
 ) -> requests.Response:
+    """Post a request for a specific leave"""
     return sess.post(HOST + POST_LEAVE_ROUTE, json=data)
+
+
+def _http_get_owner_id(sess: requests.Session) -> requests.Response:
+    """Get the owner ID from their cookies"""
+    return sess.get(HOST + ME_ROUTE, params={"fields": "id"})
 
 
 # endregion
 
 
 class MainWindow(QMainWindow):
+    """Main Qt window"""
+
     def __init__(self):
         super(MainWindow, self).__init__()
         self._logs = []
         self.setWindowTitle("Homeofficinator")
         layout = QVBoxLayout()
         self._w_cookies = QLineEdit()
-        self._w_owner_id = QSpinBox()
         self._w_days = [
             (rrule_day, QCheckBox(day_name))
             for (day_name, rrule_day) in [
@@ -198,8 +213,6 @@ class MainWindow(QMainWindow):
             [
                 QLabel("Cookies"),
                 self._w_cookies,
-                QLabel("Owner ID"),
-                self._w_owner_id,
                 QLabel("Days"),
             ]
             + [d[1] for d in self._w_days]
@@ -218,19 +231,20 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
     def log(self, text: str):
+        """Logging-like mechanism to display real-time messages"""
         self._logs.append(text)
         self._w_logs.setText("\n".join(self._logs))
 
     def validate(self):
+        """Validate and process the home office requests"""
         try:
             p = Params(
                 cookies=self._w_cookies.text(),
-                owner_id=self._w_owner_id.text(),
                 days=self._w_days,
                 date_from=self._w_date_from.date(),
                 date_to=self._w_date_to.date(),
             )
-        except (DataError, ValidationError) as e:
+        except DataError as e:
             QMessageBox.critical(self, "Error", str(e))
         else:
             for log in self.order_home_office(p):
@@ -240,7 +254,7 @@ class MainWindow(QMainWindow):
     def order_home_office(self, params: Params) -> Iterator[str]:
         """Order all home office leaves for the given period, yields logs"""
         # Get all leaves
-        leaves, owner_name = self._get_all_leaves(params)
+        leaves = self._get_all_leaves(params)
         # Request missing leaves
         for day in rrule.rrule(
             rrule.DAILY, byweekday=params.days, dtstart=params.date_from
@@ -256,7 +270,6 @@ class MainWindow(QMainWindow):
                 startsOn=daystr,
                 endsOn=daystr,
                 ownerId=params.owner_id,
-                ownerName=owner_name,
             )
             ans = _http_request_leave(params.session, data)
             if ans.status_code == 200:
@@ -265,19 +278,18 @@ class MainWindow(QMainWindow):
                 yield f"[-] FAILURE : {ans.status_code}"
 
     @staticmethod
-    def _get_all_leaves(params: Params) -> tuple[set[datetime.datetime], str]:
-        """Get all current leaves from Lucca for the current user (and also their name)"""
+    def _get_all_leaves(params: Params) -> set[datetime.datetime]:
+        """Get all current leaves from Lucca for the current user"""
         data = {
             "leavePeriod.ownerId": params.owner_id,
             "date": f"between,{params.date_from:%Y-%m-%d},{params.date_to:%Y-%m-%d}",
         }
         ans = _http_get_all_leaves(params.session, data)
-        owner_name = ans.json()["header"]["principal"]
         leaves = {
             datetime.datetime.strptime(leave["name"].split("-", 2)[1], "%Y%m%d")
             for leave in ans.json()["data"]["items"]
         }
-        return leaves, owner_name
+        return leaves
 
 
 def main():
