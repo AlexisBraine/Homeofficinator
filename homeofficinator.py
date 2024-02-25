@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Iterator, Any, Annotated
 import requests
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
     QVBoxLayout,

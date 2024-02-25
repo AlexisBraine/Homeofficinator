@@ -3,7 +3,7 @@ name = "homeofficinator"
 version = "1.0.0"
 dependencies = [
     "pydantic",
-    "PyQt5",
+    "PyQt6",
     "requests",
 ]
 requires-python = ">=3.10"
