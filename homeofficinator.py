@@ -1,5 +1,6 @@
 import datetime
 import re
+import webbrowser
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Iterator, Any, Annotated
@@ -16,6 +17,11 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QScrollArea,
+    QGroupBox,
+    QHBoxLayout,
+    QDialog,
+    QDialogButtonBox,
+    QTextEdit,
 )
 
 from dateutil import rrule
@@ -174,6 +180,43 @@ def _http_get_owner_id(sess: requests.Session) -> requests.Response:
 
 
 # endregion
+class CookiesDialog(QDialog):
+    JS_SCRIPT = "console.log(document.cookie);"
+    COOKIES_EXPLANATION = (
+        f"You can grab your cookies from {HOST}. To do so, "
+        f"simply go on this URL, open the console with F12, "
+        f"and play the following js script : "
+        f"`{JS_SCRIPT}`"
+    )
+
+    def __init__(self):
+        super(CookiesDialog, self).__init__()
+        self.setWindowTitle("How to get my cookies ?")
+        layout = QVBoxLayout()
+        main_text = QTextEdit()
+        main_text.setMarkdown(self.COOKIES_EXPLANATION)
+        layout.addWidget(main_text)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        open_button = QPushButton("Copy code and open browser")
+        open_button.clicked.connect(self.button_handler)
+        button_box = QGroupBox()
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(close_button)
+        button_layout.addWidget(open_button)
+        button_box.setLayout(button_layout)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+    def button_handler(self):
+        QApplication.clipboard().setText(self.JS_SCRIPT)
+        webbrowser.open(HOST)
+        QMessageBox.information(
+            self,
+            "Go get your cookies !",
+            "A page has been opened in your browser and "
+            "the script has been copied in your clipboard",
+        )
 
 
 class MainWindow(QMainWindow):
@@ -184,7 +227,15 @@ class MainWindow(QMainWindow):
         self._logs = []
         self.setWindowTitle("Homeofficinator")
         layout = QVBoxLayout()
+        cookies_group = QGroupBox()
         self._w_cookies = QLineEdit()
+        cookies_helper_button = QPushButton("?")
+        cookies_helper_button.setMaximumWidth(20)
+        cookies_helper_button.clicked.connect(lambda: CookiesDialog().exec())
+        cookies_layout = QHBoxLayout()
+        cookies_layout.addWidget(self._w_cookies)
+        cookies_layout.addWidget(cookies_helper_button)
+        cookies_group.setLayout(cookies_layout)
         self._w_days = [
             (rrule_day, QCheckBox(day_name))
             for (day_name, rrule_day) in [
@@ -212,7 +263,7 @@ class MainWindow(QMainWindow):
         for w in (
             [
                 QLabel("Cookies"),
-                self._w_cookies,
+                cookies_group,
                 QLabel("Days"),
             ]
             + [d[1] for d in self._w_days]
@@ -235,7 +286,7 @@ class MainWindow(QMainWindow):
         self._logs.append(text)
         self._w_logs.setText("\n".join(self._logs))
 
-    def validate(self):
+    def validate(self) -> None:
         """Validate and process the home office requests"""
         try:
             p = Params(
