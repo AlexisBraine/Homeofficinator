@@ -1,28 +1,29 @@
 import datetime
 import re
 import webbrowser
+from abc import ABC
 from dataclasses import dataclass
-from functools import cached_property
-from typing import Iterator, Any, Annotated
-import requests
-from PyQt6.QtWidgets import (
-    QApplication,
-    QWidget,
-    QVBoxLayout,
-    QPushButton,
-    QLineEdit,
-    QLabel,
-    QDateEdit,
-    QCheckBox,
-    QMainWindow,
-    QMessageBox,
-    QScrollArea,
-    QGroupBox,
-    QHBoxLayout,
-    QDialog,
-    QDialogButtonBox,
-    QTextEdit,
+from functools import cached_property, wraps
+from tkinter import (
+    VERTICAL,
+    HORIZONTAL,
+    Frame,
+    PanedWindow,
+    StringVar,
+    Entry,
+    Button,
+    Checkbutton,
+    Label,
+    Tk,
+    IntVar,
+    Toplevel,
+    LEFT,
+    Text,
+    END,
 )
+from tkinter.messagebox import showerror
+from typing import Iterator, Any, Annotated, Callable
+import requests
 
 from dateutil import rrule
 from pydantic import (
@@ -30,6 +31,12 @@ from pydantic import (
     model_validator,
     BeforeValidator,
 )
+from tkcalendar import DateEntry
+
+# Just for nuitka
+from babel import numbers
+
+_nope = numbers.overload
 
 
 # region Constants
@@ -87,27 +94,42 @@ class DataError(Exception):
         return self.msg
 
 
-def wdate_to_datetime(wdate: Any) -> datetime.datetime:
-    return datetime.datetime.combine(wdate.toPyDate(), datetime.time())
+class ExecutionError(Exception, ABC): ...
 
 
-def check_cookies(raw_cookies: str) -> dict[str, str]:
-    if not raw_cookies:
-        raise DataError("Please provide cookies")
-    if not re.match(r".+=.+(;.+=.+)*;?", raw_cookies):
-        raise DataError("Cookies format is not ok")
-    return dict(c.strip().rsplit("=", 1) for c in raw_cookies.split(";"))
+@dataclass
+class HttpError(ExecutionError):
+    route: str
+    function: str
+    err: Exception
+
+    def __str__(self):
+        return f"Network error on {self.route} ({self.function}) : {self.err}"
 
 
-def check_days(raw_days: list[tuple[rrule.weekday, QCheckBox]]) -> list[rrule.weekday]:
-    res = [d[0] for d in raw_days if d[1].isChecked()]
+def date_to_datetime(date_: datetime.date) -> datetime.datetime:
+    return datetime.datetime.combine(date_, datetime.time())
+
+
+def check_auth_token(auth_token: str) -> str:
+    if not auth_token:
+        raise DataError("Please provide authToken")
+    if not re.match(r"[0-9a-g-]+", auth_token):
+        raise DataError("AuthToken format is not ok")
+    return auth_token
+
+
+def check_days(
+    raw_days: list[tuple[rrule.weekday, Any, IntVar]]
+) -> list[rrule.weekday]:
+    res = [rrule_day for _, rrule_day, var in raw_days if var.get()]
     if not res:
         raise DataError("Select at least one day")
     return res
 
 
-DateValidator = Annotated[datetime.datetime, BeforeValidator(wdate_to_datetime)]
-Cookies = Annotated[dict[str, str], BeforeValidator(check_cookies)]
+DateValidator = Annotated[datetime.datetime, BeforeValidator(date_to_datetime)]
+AuthTokenCookie = Annotated[str, BeforeValidator(check_auth_token)]
 DayList = Annotated[list[rrule.weekday], BeforeValidator(check_days)]
 
 
@@ -117,7 +139,7 @@ class Params(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-    cookies: Cookies
+    auth_token: AuthTokenCookie
     date_from: DateValidator
     date_to: DateValidator
     days: DayList
@@ -130,13 +152,13 @@ class Params(BaseModel):
             or self.date_to - self.date_from
             > datetime.timedelta(days=MAX_DAYS_BETWEEN_DATES)
         ):
-            raise DataError("Dates incorrect (cannot be more than 100 days apart")
+            raise DataError("Dates are incorrect (cannot be more than 100 days apart)")
 
     @cached_property
     def session(self) -> requests.Session:
         """Return a session initiated with the user-given sweet sweet cookies"""
         sess = requests.Session()
-        sess.cookies.update(self.cookies)
+        sess.cookies.update({"authToken": self.auth_token})
         return sess
 
     @cached_property
@@ -157,6 +179,25 @@ class Params(BaseModel):
 
 # region http calls
 #  Here, all the HTTP calls will be stored, for ease of decoupling
+def decorate_http(route: str):
+    def wrap(
+        func: Callable[..., requests.Response]
+    ) -> Callable[..., requests.Response]:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                ans = func(*args, **kwargs)
+                ans.raise_for_status()
+                return ans
+            except Exception as e:
+                raise HttpError(route, func.__name__, e)
+
+        return wrapper
+
+    return wrap
+
+
+@decorate_http(HOST + GET_LEAVE_ROUTE)
 def _http_get_all_leaves(
     sess: requests.Session, data: dict[str, Any]
 ) -> requests.Response:
@@ -167,6 +208,7 @@ def _http_get_all_leaves(
     )
 
 
+@decorate_http(HOST + POST_LEAVE_ROUTE)
 def _http_request_leave(
     sess: requests.Session, data: dict[str, Any]
 ) -> requests.Response:
@@ -174,133 +216,158 @@ def _http_request_leave(
     return sess.post(HOST + POST_LEAVE_ROUTE, json=data)
 
 
+@decorate_http(HOST + ME_ROUTE)
 def _http_get_owner_id(sess: requests.Session) -> requests.Response:
     """Get the owner ID from their cookies"""
     return sess.get(HOST + ME_ROUTE, params={"fields": "id"})
 
 
 # endregion
-class CookiesDialog(QDialog):
-    JS_SCRIPT = "console.log(document.cookie);"
+
+
+class CookiesDialog:
+
     COOKIES_EXPLANATION = (
         f"You can grab your cookies from {HOST}. To do so, "
-        f"simply go on this URL, open the console with F12, "
-        f"and play the following js script : "
-        f"`{JS_SCRIPT}`"
+        f"simply go on this URL, open the dev tools with F12, "
+        f"and go on the Application tab.\n"
+        f"Then, into the Storage section, select Cookies, then {HOST} "
+        f"in the dropdown. It should show you an array, with multiple "
+        f'columns like "Name" and "Value".\n'
+        f'On the line name "authToken", copy the value and paste it '
+        f"in this field"
     )
 
-    def __init__(self):
-        super(CookiesDialog, self).__init__()
-        self.setWindowTitle("How to get my cookies ?")
-        layout = QVBoxLayout()
-        main_text = QTextEdit()
-        main_text.setMarkdown(self.COOKIES_EXPLANATION)
-        layout.addWidget(main_text)
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.close)
-        open_button = QPushButton("Copy code and open browser")
-        open_button.clicked.connect(self.button_handler)
-        button_box = QGroupBox()
-        button_layout = QHBoxLayout()
-        button_layout.addWidget(close_button)
-        button_layout.addWidget(open_button)
-        button_box.setLayout(button_layout)
-        layout.addWidget(button_box)
-        self.setLayout(layout)
+    def __init__(self, master):
+        self.top = Toplevel(master)
+        self.top.title("How to get my cookies ?")
 
-    def button_handler(self):
-        QApplication.clipboard().setText(self.JS_SCRIPT)
-        webbrowser.open(HOST)
-        QMessageBox.information(
-            self,
-            "Go get your cookies !",
-            "A page has been opened in your browser and "
-            "the script has been copied in your clipboard",
+        main_layout = PanedWindow(
+            self.top,
+            orient=VERTICAL,
         )
+        main_layout.add(
+            Label(
+                main_layout, text=self.COOKIES_EXPLANATION, wraplength=400, justify=LEFT
+            )
+        )
+        button_layout = PanedWindow(main_layout, orient=HORIZONTAL)
+        button_layout.add(Button(button_layout, text="Close", command=self.top.destroy))
+        button_layout.add(
+            Button(
+                button_layout,
+                text="Open browser",
+                command=self.button_handler,
+            )
+        )
+        main_layout.add(button_layout)
+        main_layout.pack()
+
+    @staticmethod
+    def button_handler():
+        webbrowser.open(HOST)
 
 
-class MainWindow(QMainWindow):
-    """Main Qt window"""
+class MainWindow(Frame):
+    """Main Tk window"""
 
-    def __init__(self):
-        super(MainWindow, self).__init__()
-        self._logs = []
-        self.setWindowTitle("Homeofficinator")
-        layout = QVBoxLayout()
-        cookies_group = QGroupBox()
-        self._w_cookies = QLineEdit()
-        cookies_helper_button = QPushButton("?")
-        cookies_helper_button.setMaximumWidth(20)
-        cookies_helper_button.clicked.connect(lambda: CookiesDialog().exec())
-        cookies_layout = QHBoxLayout()
-        cookies_layout.addWidget(self._w_cookies)
-        cookies_layout.addWidget(cookies_helper_button)
-        cookies_group.setLayout(cookies_layout)
+    def __init__(self, master: Toplevel | Tk):
+        super(MainWindow, self).__init__(master)
+        # I don't want the current window to be resizable
+        master.resizable(False, False)
+
+        main_paned_window = PanedWindow(self, orient=VERTICAL, width=300)
+
+        master.title("Homeofficinator")
+
+        # Cookies group
+        cookies_group = PanedWindow(main_paned_window, orient=HORIZONTAL)
+        self._var_authtoken = StringVar()
+        cookies_group.add(Entry(cookies_group, textvariable=self._var_authtoken))
+        cookies_group.add(
+            Button(
+                cookies_group,
+                text="?",
+                width=10,
+                command=lambda: master.wait_window(
+                    CookiesDialog(main_paned_window).top
+                ),
+            )
+        )
+        cookies_group.pack()
+
         self._w_days = [
-            (rrule_day, QCheckBox(day_name))
-            for (day_name, rrule_day) in [
-                ("Monday", rrule.MO),
-                ("Tuesday", rrule.TU),
-                ("Wednesday", rrule.WE),
-                ("Thursday", rrule.TH),
-                ("Friday", rrule.FR),
-            ]
+            ("Monday", rrule.MO, IntVar()),
+            ("Tuesday", rrule.TU, IntVar()),
+            ("Wednesday", rrule.WE, IntVar()),
+            ("Thursday", rrule.TH, IntVar()),
+            ("Friday", rrule.FR, IntVar()),
         ]
+        days_checkbuttons = [
+            Checkbutton(main_paned_window, text=day_name, variable=var, anchor="w")
+            for day_name, _, var in self._w_days
+        ]
+
         now = datetime.date.today()
-        self._w_date_from = QDateEdit()
-        self._w_date_from.setDisplayFormat("dd/MM/yyyy")
-        self._w_date_from.setDate(now)
-        self._w_date_to = QDateEdit()
-        self._w_date_to.setDisplayFormat("dd/MM/yyyy")
-        self._w_date_to.setDate(now + datetime.timedelta(days=60))
-        self._w_button = QPushButton("Let's go !")
-        self._w_button.clicked.connect(self.validate)
-        self._w_logs = QLabel()
-        self._w_logs.setWordWrap(True)
-        scroll = QScrollArea()
-        scroll.setWidget(self._w_logs)
-        scroll.setWidgetResizable(True)
+        self._widget_date_from = DateEntry(main_paned_window, locale="fr_FR")
+        self._widget_date_from.set_date(now)
+        self._widget_date_to = DateEntry(main_paned_window, locale="fr_FR")
+        self._widget_date_to.set_date(now + datetime.timedelta(days=60))
+        main_button = Button(
+            main_paned_window, text="Let's go !", command=self.validate
+        )
+        self._var_logs = StringVar()
+        self._widget_logs_text = Text(
+            main_paned_window,
+            background="black",
+            foreground="lightgrey",
+            font="Monospace 10",
+            height=10,
+        )
         for w in (
             [
-                QLabel("Cookies"),
+                Label(main_paned_window, text="AuthToken", anchor="w"),
                 cookies_group,
-                QLabel("Days"),
+                Label(main_paned_window, text="Days", anchor="w"),
             ]
-            + [d[1] for d in self._w_days]
+            + days_checkbuttons
             + [
-                QLabel("Date from"),
-                self._w_date_from,
-                QLabel("Date to"),
-                self._w_date_to,
-                self._w_button,
-                scroll,
+                Label(main_paned_window, text="Date from", anchor="w"),
+                self._widget_date_from,
+                Label(main_paned_window, text="Date to", anchor="w"),
+                self._widget_date_to,
+                main_button,
+                self._widget_logs_text,
             ]
         ):
-            layout.addWidget(w)
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
+            main_paned_window.add(w)
+        main_paned_window.pack(side=LEFT)
+        self.pack(side=LEFT)
 
     def log(self, text: str):
         """Logging-like mechanism to display real-time messages"""
-        self._logs.append(text)
-        self._w_logs.setText("\n".join(self._logs))
+        self._widget_logs_text.insert(END, text + "\n")
 
     def validate(self) -> None:
         """Validate and process the home office requests"""
+        p = None
         try:
             p = Params(
-                cookies=self._w_cookies.text(),
+                auth_token=self._var_authtoken.get(),
                 days=self._w_days,
-                date_from=self._w_date_from.date(),
-                date_to=self._w_date_to.date(),
+                date_from=self._widget_date_from.get_date(),
+                date_to=self._widget_date_to.get_date(),
             )
-        except DataError as e:
-            QMessageBox.critical(self, "Error", str(e))
-        else:
             for log in self.order_home_office(p):
                 self.log(log)
             p.close()
+        except DataError as e:
+            showerror("Error in the parameters", str(e))
+        except ExecutionError as e:
+            showerror("Error during execution", str(e))
+        finally:
+            if p:
+                p.close()
 
     def order_home_office(self, params: Params) -> Iterator[str]:
         """Order all home office leaves for the given period, yields logs"""
@@ -345,13 +412,9 @@ class MainWindow(QMainWindow):
 
 def main():
     """Main method, executed at every cycle"""
-    app = QApplication([])
-    window = MainWindow()
-    window.show()
-    try:
-        app.exec()
-    except Exception as e:
-        print(e.__class__)
+    root = Tk()
+    app = MainWindow(root)
+    app.mainloop()
 
 
 main()
