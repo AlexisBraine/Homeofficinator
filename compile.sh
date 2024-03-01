@@ -1,1 +1,1 @@
-python -m nuitka --onefile homeofficinator.py --enable-plugin=pyqt6
+python -m nuitka --onefile homeofficinator.py --enable-plugin=tk-inter
